@@ -1,12 +1,15 @@
 """
 llm_client.py
 Wraps calls to a single, fixed open-source model (Meta's Llama 3.1 8B
-Instruct) via Groq's API, so every tier in a given run is answered by the
-SAME model - no silent mid-run swaps to a different model, which would
-confound the comparison between the classical policy and "the LLM agent."
+Instruct) via Groq's API.
 
-Groq hosts open-weight models on dedicated fast hardware and offers a
-genuinely free tier (14,400 requests/day, no credit card).
+IMPORTANT DESIGN CHOICE: all 4 tiers' decisions for a given week are
+requested in ONE API call (not four separate calls). The model reasons
+through the chain in order - Retailer's order becomes Distributor's demand
+signal, and so on - inside a single prompt/response. This cuts API calls
+(and tokens, and run time) by 4x versus calling once per tier, and avoids
+needing four separate rate-limited round trips per week.
+
 Get a free key at https://console.groq.com/keys
 """
 
@@ -16,17 +19,13 @@ import re
 import time
 from groq import Groq
 
-# Single fixed model for the whole run - keeps the experiment clean.
-# (Previously this tried a second, different-strength model as a
-# fallback, which meant some weeks were secretly answered by a
-# different model than others - a confound. Retrying the SAME model
-# with backoff is the correct way to handle transient rate limits.)
 MODEL_ID = "llama-3.1-8b-instant"
-MAX_RETRIES = 3
+MAX_RETRIES = 2
 RETRY_DELAY_SECONDS = 2
+TIER_ORDER = ["retailer", "distributor", "manufacturer", "supplier"]
 
 _client = None
-fallback_call_count = 0  # exposed so the UI can warn if this run degraded
+fallback_call_count = 0  # exposed so the UI can warn if a run degraded
 
 
 def get_client():
@@ -39,84 +38,103 @@ def get_client():
     return _client
 
 
-AGENT_SYSTEM_PROMPT = """You are {role} in a 4-tier supply chain
-(Retailer -> Distributor -> Manufacturer -> Supplier).
-Each week you see the order placed by the tier below you (your "demand
-signal"), your current inventory, and your current backlog (unfilled
-orders). You must decide how many units to order from the tier above you.
-
-Base your decision ONLY on the actual numbers given below - do not assume
-demand is continuing at a past average if the current demand signal says
-otherwise. If demand signal is 0, treat that as real information.
-
-Rules of thumb real supply-chain planners use (and often overreact with):
-- If demand looks like it's rising, order extra as a buffer (this is what
-  causes the bullwhip effect - be realistic, don't be a perfect optimizer).
-- If you have a backlog, order more to catch up.
-- If inventory is piling up, order less.
-
-Respond ONLY with compact JSON, no other text:
-{{"order_quantity": <integer>, "reasoning": "<one short sentence>"}}
-"""
-
-
 def reset_fallback_counter():
     global fallback_call_count
     fallback_call_count = 0
 
 
-def get_llm_order_decision(role, demand_signal, inventory, backlog, order_history):
+BATCH_SYSTEM_PROMPT = """You are simulating one week of decisions across a
+4-tier supply chain: Retailer -> Distributor -> Manufacturer -> Supplier.
+
+Demand signal flow this week (process in this exact order):
+1. Retailer's demand signal = customer demand (given below).
+2. Distributor's demand signal = the order quantity YOU decide for Retailer in step 1.
+3. Manufacturer's demand signal = the order quantity YOU decide for Distributor in step 2.
+4. Supplier's demand signal = the order quantity YOU decide for Manufacturer in step 3.
+
+For each tier, decide an order quantity using this logic:
+- Base decisions ONLY on the actual numbers given - do not assume a trend
+  the numbers don't support. If a demand signal is 0, treat that as real.
+- If a tier's demand signal is rising, it's realistic to order extra as a
+  buffer (this tendency is what causes the bullwhip effect).
+- If a tier has a backlog, it should order more to catch up.
+- If a tier's inventory is piling up, it should order less.
+
+Current state per tier:
+{tier_details}
+
+Customer demand this week: {customer_demand} units.
+
+Respond ONLY with compact JSON in exactly this shape, no other text:
+{{"retailer": {{"order_quantity": <int>, "reasoning": "<short sentence>"}},
+ "distributor": {{"order_quantity": <int>, "reasoning": "<short sentence>"}},
+ "manufacturer": {{"order_quantity": <int>, "reasoning": "<short sentence>"}},
+ "supplier": {{"order_quantity": <int>, "reasoning": "<short sentence>"}}}}
+"""
+
+
+def _fallback_all(customer_demand, tier_states, note=None):
+    """Simple heuristic fallback for all 4 tiers, used only if the batch
+    API call fails after retries (no key, sustained outage, etc.)."""
+    result = {}
+    demand_signal = customer_demand
+    tag = "[fallback heuristic]" if not note else f"[fallback heuristic - {note}]"
+    for tier in TIER_ORDER:
+        backlog = tier_states[tier]["backlog"]
+        qty = max(0, demand_signal + backlog // 2)
+        result[tier] = (qty, tag)
+        demand_signal = qty  # next tier's signal is this tier's order
+    return result
+
+
+def get_all_tier_decisions(customer_demand, tier_states):
     """
-    Calls Groq to get an order-quantity decision + short reasoning from the
-    fixed model. Retries the SAME model up to MAX_RETRIES times (with a
-    short delay) on transient errors like rate limits, so a brief hiccup
-    doesn't silently swap in a different model's behavior. Only falls back
-    to the simple heuristic if every retry fails (e.g. no API key, or a
-    sustained outage) - and that fallback is counted so the UI can flag it.
+    tier_states: dict tier_name -> {"inventory": int, "backlog": int, "order_history": list}
+    Returns dict tier_name -> (order_qty, reasoning_str) for all 4 tiers,
+    from a SINGLE Groq API call.
     """
     global fallback_call_count
-
-    history_str = ", ".join(str(x) for x in order_history[-5:]) or "none yet"
-    user_prompt = (
-        f"This week's incoming demand signal: {demand_signal} units.\n"
-        f"Your current inventory: {inventory} units.\n"
-        f"Your current backlog: {backlog} units.\n"
-        f"Your last 5 order quantities: {history_str}.\n"
-        f"Decide your order quantity for this week."
-    )
 
     client = get_client()
     if client is None:
         fallback_call_count += 1
-        fallback_qty = max(0, demand_signal + backlog // 2)
-        return fallback_qty, "[fallback heuristic - no GROQ_API_KEY set]"
+        return _fallback_all(customer_demand, tier_states, note="no GROQ_API_KEY set")
+
+    tier_lines = []
+    for tier in TIER_ORDER:
+        st = tier_states[tier]
+        hist = ", ".join(str(x) for x in st["order_history"][-5:]) or "none yet"
+        tier_lines.append(
+            f"- {tier.capitalize()}: inventory={st['inventory']}, "
+            f"backlog={st['backlog']}, last 5 orders=[{hist}]"
+        )
+    tier_details = "\n".join(tier_lines)
+    prompt = BATCH_SYSTEM_PROMPT.format(tier_details=tier_details, customer_demand=customer_demand)
 
     last_error = None
-
     for attempt in range(MAX_RETRIES):
         try:
             completion = client.chat.completions.create(
                 model=MODEL_ID,
-                messages=[
-                    {"role": "system", "content": AGENT_SYSTEM_PROMPT.format(role=role)},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=120,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=400,
                 temperature=0.7,
             )
             text = completion.choices[0].message.content
             match = re.search(r"\{.*\}", text, re.DOTALL)
             parsed = json.loads(match.group(0))
-            qty = int(parsed.get("order_quantity", demand_signal))
-            reasoning = parsed.get("reasoning", "")
-            return max(0, qty), f"[{MODEL_ID}] {reasoning}"
+            result = {}
+            for tier in TIER_ORDER:
+                t = parsed.get(tier, {})
+                qty = max(0, int(t.get("order_quantity", 0)))
+                reasoning = t.get("reasoning", "")
+                result[tier] = (qty, f"[{MODEL_ID}] {reasoning}")
+            return result
         except Exception as e:
             last_error = f"attempt {attempt + 1} -> {type(e).__name__}: {str(e)[:150]}"
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY_SECONDS)
             continue
 
-    # All retries on the SAME model failed - fallback heuristic, counted.
     fallback_call_count += 1
-    fallback_qty = max(0, demand_signal + backlog // 2)
-    return fallback_qty, f"[fallback heuristic - {MODEL_ID} failed after {MAX_RETRIES} tries. {last_error}]"
+    return _fallback_all(customer_demand, tier_states, note=f"batch call failed. {last_error}")
