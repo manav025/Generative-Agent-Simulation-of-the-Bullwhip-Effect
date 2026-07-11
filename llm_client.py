@@ -1,26 +1,23 @@
 """
 llm_client.py
-Wraps calls to free, open-source models via Hugging Face's Inference
-Providers router (the current free-tier system as of 2026 - it routes
-requests to partner providers like Together, Novita, Cerebras, etc.).
+Wraps calls to a free, open-source model (Meta's Llama 3.1 8B Instruct)
+via Groq's API. Groq hosts open-weight models on dedicated fast hardware
+and offers a genuinely free tier (14,400 requests/day, no credit card) -
+far more reliable for a live demo than Hugging Face's shared routed
+inference credits, which are easy to exhaust in a single simulation run.
 
-Tries a short list of known-reliable open models in order, since provider
-availability can shift; the first one that succeeds is used and logged.
+Get a free key at https://console.groq.com/keys
 """
 
 import json
 import os
 import re
-from huggingface_hub import InferenceClient
+from groq import Groq
 
-# Candidate models, tried in order. All are open-weight and commonly
-# served warm by at least one Inference Provider on the free tier.
-# If HF changes routing again, add/replace entries here.
+# Candidate models, tried in order, all open-weight and free on Groq.
 MODEL_CANDIDATES = [
-    "meta-llama/Llama-3.1-8B-Instruct",
-    "Qwen/Qwen2.5-7B-Instruct",
-    "mistralai/Mistral-7B-Instruct-v0.2",
-    "HuggingFaceH4/zephyr-7b-beta",
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
 ]
 
 _client = None
@@ -29,10 +26,10 @@ _client = None
 def get_client():
     global _client
     if _client is None:
-        token = os.environ.get("HF_TOKEN")
-        # provider="auto" (the default) lets HF route to whichever
-        # partner currently serves the requested model.
-        _client = InferenceClient(api_key=token, provider="auto")
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            return None
+        _client = Groq(api_key=api_key)
     return _client
 
 
@@ -55,11 +52,10 @@ Respond ONLY with compact JSON, no other text:
 
 def get_llm_order_decision(role, demand_signal, inventory, backlog, order_history):
     """
-    Calls Hugging Face's Inference Providers router to get an order-quantity
-    decision + short reasoning. Tries each model in MODEL_CANDIDATES until
-    one succeeds. Falls back to a simple heuristic only if all of them fail
-    (e.g. no token, or every provider is down) so the simulation never
-    crashes.
+    Calls Groq to get an order-quantity decision + short reasoning from an
+    open-source LLM. Tries each model in MODEL_CANDIDATES until one
+    succeeds. Falls back to a simple heuristic only if all fail (e.g. no
+    API key set, or rate limit hit) so the simulation never crashes.
     """
     history_str = ", ".join(str(x) for x in order_history[-5:]) or "none yet"
     user_prompt = (
@@ -71,6 +67,10 @@ def get_llm_order_decision(role, demand_signal, inventory, backlog, order_histor
     )
 
     client = get_client()
+    if client is None:
+        fallback_qty = max(0, demand_signal + backlog // 2)
+        return fallback_qty, "[fallback heuristic - no GROQ_API_KEY set]"
+
     last_error = None
 
     for model_id in MODEL_CANDIDATES:
