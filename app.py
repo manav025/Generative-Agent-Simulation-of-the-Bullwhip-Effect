@@ -51,6 +51,12 @@ with st.sidebar:
         if manual_key:
             os.environ["GROQ_API_KEY"] = manual_key
 
+    include_informed = st.checkbox(
+        "Also test 'informed' LLM agents (full demand visibility)",
+        value=True,
+        help="Roughly doubles API calls/run time, since it runs a third simulation.",
+    )
+
     run_button = st.button("Run Simulation", type="primary")
 
 
@@ -74,27 +80,48 @@ if run_button:
     classical_time = time.time() - t0
 
     t0 = time.time()
-    with st.spinner("Running LLM-agent simulation (calling Groq)..."):
+    with st.spinner("Running LLM-agent simulation (isolated - calling Groq)..."):
         llm_client.reset_fallback_counter()
         llm_state = run_simulation(total_weeks, "llm", demand_series)
-        if llm_client.fallback_call_count > 0:
+        isolated_fallbacks = llm_client.fallback_call_count
+        if isolated_fallbacks > 0:
             st.warning(
-                f"⚠️ {llm_client.fallback_call_count} of {total_weeks} weekly agent calls "
-                f"fell back to the simple heuristic (likely rate limits). Those weeks "
-                f"are NOT pure LLM reasoning - re-run for a cleaner result, or reduce "
-                f"'Number of weeks' to lower the total call volume."
+                f"⚠️ Isolated LLM run: {isolated_fallbacks} of {total_weeks} weekly calls "
+                f"fell back to the simple heuristic (likely rate limits)."
             )
     llm_time = time.time() - t0
 
+    informed_state = None
+    informed_time = 0.0
+    if include_informed:
+        t0 = time.time()
+        with st.spinner("Running LLM-agent simulation (informed - calling Groq)..."):
+            llm_client.reset_fallback_counter()
+            informed_state = run_simulation(total_weeks, "llm_informed", demand_series)
+            informed_fallbacks = llm_client.fallback_call_count
+            if informed_fallbacks > 0:
+                st.warning(
+                    f"⚠️ Informed LLM run: {informed_fallbacks} of {total_weeks} weekly calls "
+                    f"fell back to the simple heuristic (likely rate limits)."
+                )
+        informed_time = time.time() - t0
+
     st.caption(
-        f"⏱️ Classical run: {classical_time:.1f}s | LLM run: {llm_time:.1f}s "
-        f"({llm_time / max(total_weeks - llm_client.fallback_call_count, 1):.2f}s per real API call)"
+        f"⏱️ Classical: {classical_time:.1f}s | LLM (isolated): {llm_time:.1f}s"
+        + (f" | LLM (informed): {informed_time:.1f}s" if include_informed else "")
     )
 
     st.subheader("📈 Orders Placed by Each Tier")
-    tab1, tab2 = st.tabs(["Classical Policy", "LLM Agents"])
+    tab_labels = ["Classical Policy", "LLM Agents (Isolated)"]
+    tab_states = [classical_state, llm_state]
+    tab_titles = ["Classical", "LLM Agent (Isolated)"]
+    if include_informed:
+        tab_labels.append("LLM Agents (Informed)")
+        tab_states.append(informed_state)
+        tab_titles.append("LLM Agent (Informed)")
 
-    for tab, state, label in [(tab1, classical_state, "Classical"), (tab2, llm_state, "LLM Agent")]:
+    tabs = st.tabs(tab_labels)
+    for tab, state, label in zip(tabs, tab_states, tab_titles):
         with tab:
             fig = go.Figure()
             fig.add_trace(go.Scatter(y=demand_series, name="Customer Demand", line=dict(dash="dot", color="black")))
@@ -107,29 +134,48 @@ if run_button:
     classical_ratios = bullwhip_ratios(demand_series, classical_state["order_history"])
     llm_ratios = bullwhip_ratios(demand_series, llm_state["order_history"])
 
-    df = pd.DataFrame({
+    ratio_data = {
         "Tier": [t.capitalize() for t in TIERS],
         "Classical Policy": [classical_ratios[t] for t in TIERS],
-        "LLM Agents": [llm_ratios[t] for t in TIERS],
-    })
+        "LLM Agents (Isolated)": [llm_ratios[t] for t in TIERS],
+    }
+    if include_informed:
+        informed_ratios = bullwhip_ratios(demand_series, informed_state["order_history"])
+        ratio_data["LLM Agents (Informed)"] = [informed_ratios[t] for t in TIERS]
+
+    df = pd.DataFrame(ratio_data)
     st.dataframe(df, width='stretch', hide_index=True)
 
-    fig2 = go.Figure(data=[
+    bars = [
         go.Bar(name="Classical Policy", x=df["Tier"], y=df["Classical Policy"]),
-        go.Bar(name="LLM Agents", x=df["Tier"], y=df["LLM Agents"]),
-    ])
+        go.Bar(name="LLM Agents (Isolated)", x=df["Tier"], y=df["LLM Agents (Isolated)"]),
+    ]
+    if include_informed:
+        bars.append(go.Bar(name="LLM Agents (Informed)", x=df["Tier"], y=df["LLM Agents (Informed)"]))
+
+    fig2 = go.Figure(data=bars)
     fig2.update_layout(barmode="group", title="Bullwhip Amplification by Tier", yaxis_title="Bullwhip Ratio")
     st.plotly_chart(fig2, width='stretch')
 
     st.info(
         "A ratio above 1 means that tier is over-reacting to demand changes "
-        "relative to the customer — the classic bullwhip signature. Compare "
-        "how LLM agents amplify (or dampen) this versus the textbook policy."
+        "relative to the customer — the classic bullwhip signature. 'Isolated' "
+        "agents only see the order from the tier below them (a distorted, "
+        "secondhand signal). 'Informed' agents also see the real customer "
+        "demand history directly — this tests whether information sharing "
+        "reduces bullwhip amplification for LLM agents, and whether they can "
+        "use that visibility to distinguish real trend shifts from noise "
+        "better than a rigid formula can."
     )
 
-    with st.expander("🧠 See LLM agent reasoning log"):
+    with st.expander("🧠 See LLM agent reasoning log (isolated)"):
         reasoning_df = pd.DataFrame(llm_state["reasoning_log"])
         st.dataframe(reasoning_df, width='stretch', hide_index=True)
+
+    if include_informed:
+        with st.expander("🧠 See LLM agent reasoning log (informed)"):
+            informed_reasoning_df = pd.DataFrame(informed_state["reasoning_log"])
+            st.dataframe(informed_reasoning_df, width='stretch', hide_index=True)
 
 else:
     st.write("👈 Set your parameters in the sidebar and click **Run Simulation** to begin.")
