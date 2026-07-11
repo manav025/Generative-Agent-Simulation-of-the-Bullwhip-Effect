@@ -32,14 +32,23 @@ with st.sidebar:
     shock_size = st.slider("Shock size (extra units)", 0, 100, 30)
     noise = st.slider("Demand noise (std dev)", 0, 20, 5)
 
-    groq_key = st.text_input(
-        "Groq API Key (optional — leave blank to use fallback heuristic)",
-        type="password",
-        help="Get a free key at console.groq.com/keys — no credit card required. "
-             "Without it, LLM-mode agents fall back to a simple heuristic.",
-    )
+    # Prefer a key configured in Streamlit Cloud secrets (shared by the app
+    # owner) so visitors don't need their own Groq account. Falls back to
+    # a manual input field if no secret is configured.
+    groq_key = st.secrets.get("GROQ_API_KEY", None)
+
     if groq_key:
         os.environ["GROQ_API_KEY"] = groq_key
+        st.success("✅ Groq API connected (shared key)")
+    else:
+        manual_key = st.text_input(
+            "Groq API Key (optional — leave blank to use fallback heuristic)",
+            type="password",
+            help="Get a free key at console.groq.com/keys — no credit card required. "
+                 "Without it, LLM-mode agents fall back to a simple heuristic.",
+        )
+        if manual_key:
+            os.environ["GROQ_API_KEY"] = manual_key
 
     run_button = st.button("Run Simulation", type="primary")
 
