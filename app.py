@@ -65,11 +65,15 @@ def make_demand_series(total_weeks, base_demand, shock_week, shock_size, noise):
 
 
 if run_button:
+    import time
     demand_series = make_demand_series(total_weeks, base_demand, shock_week, shock_size, noise)
 
+    t0 = time.time()
     with st.spinner("Running classical order-up-to-S simulation..."):
         classical_state = run_simulation(total_weeks, "classical", demand_series)
+    classical_time = time.time() - t0
 
+    t0 = time.time()
     with st.spinner("Running LLM-agent simulation (calling Groq)..."):
         llm_client.reset_fallback_counter()
         llm_state = run_simulation(total_weeks, "llm", demand_series)
@@ -80,6 +84,12 @@ if run_button:
                 f"are NOT pure LLM reasoning - re-run for a cleaner result, or reduce "
                 f"'Number of weeks' to lower the total call volume."
             )
+    llm_time = time.time() - t0
+
+    st.caption(
+        f"⏱️ Classical run: {classical_time:.1f}s | LLM run: {llm_time:.1f}s "
+        f"({llm_time / max(total_weeks - llm_client.fallback_call_count, 1):.2f}s per real API call)"
+    )
 
     st.subheader("📈 Orders Placed by Each Tier")
     tab1, tab2 = st.tabs(["Classical Policy", "LLM Agents"])
