@@ -75,7 +75,7 @@ if run_button:
         llm_state = run_simulation(total_weeks, "llm", demand_series)
         if llm_client.fallback_call_count > 0:
             st.warning(
-                f"⚠️ {llm_client.fallback_call_count} of {total_weeks * 4} agent calls "
+                f"⚠️ {llm_client.fallback_call_count} of {total_weeks} weekly agent calls "
                 f"fell back to the simple heuristic (likely rate limits). Those weeks "
                 f"are NOT pure LLM reasoning - re-run for a cleaner result, or reduce "
                 f"'Number of weeks' to lower the total call volume."
