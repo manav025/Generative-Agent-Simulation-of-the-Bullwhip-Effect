@@ -7,8 +7,18 @@ IMPORTANT DESIGN CHOICE: all 4 tiers' decisions for a given week are
 requested in ONE API call (not four separate calls). The model reasons
 through the chain in order - Retailer's order becomes Distributor's demand
 signal, and so on - inside a single prompt/response. This cuts API calls
-(and tokens, and run time) by 4x versus calling once per tier, and avoids
-needing four separate rate-limited round trips per week.
+(and tokens, and run time) by 4x versus calling once per tier.
+
+TWO LLM MODES:
+- "isolated": each tier only ever sees the order placed by the tier below
+  it - never the real customer demand (this is what causes bullwhip: a
+  distorted, secondhand signal, like a game of telephone).
+- "informed": every tier ALSO sees the real customer demand history
+  directly, alongside its local signal. This tests whether the classic
+  supply-chain finding "information sharing reduces the bullwhip effect"
+  holds for LLM agents too - and whether an LLM, unlike a rigid formula,
+  can use that visibility to actually distinguish real trend from noise
+  rather than just overreacting less.
 
 Get a free key at https://console.groq.com/keys
 """
@@ -43,14 +53,17 @@ def reset_fallback_counter():
     fallback_call_count = 0
 
 
-BATCH_SYSTEM_PROMPT = """You are simulating one week of decisions across a
-4-tier supply chain: Retailer -> Distributor -> Manufacturer -> Supplier.
+BATCH_SYSTEM_PROMPT_ISOLATED = """You are simulating one week of decisions
+across a 4-tier supply chain: Retailer -> Distributor -> Manufacturer -> Supplier.
 
 Demand signal flow this week (process in this exact order):
 1. Retailer's demand signal = customer demand (given below).
 2. Distributor's demand signal = the order quantity YOU decide for Retailer in step 1.
 3. Manufacturer's demand signal = the order quantity YOU decide for Distributor in step 2.
 4. Supplier's demand signal = the order quantity YOU decide for Manufacturer in step 3.
+
+Each tier can ONLY see the demand signal described above - not the real
+customer demand directly (except the Retailer, who sees it first-hand).
 
 For each tier, decide an order quantity using this logic:
 - Base decisions ONLY on the actual numbers given - do not assume a trend
@@ -63,6 +76,38 @@ For each tier, decide an order quantity using this logic:
 Current state per tier:
 {tier_details}
 
+Customer demand this week: {customer_demand} units.
+
+Respond ONLY with compact JSON in exactly this shape, no other text:
+{{"retailer": {{"order_quantity": <int>, "reasoning": "<short sentence>"}},
+ "distributor": {{"order_quantity": <int>, "reasoning": "<short sentence>"}},
+ "manufacturer": {{"order_quantity": <int>, "reasoning": "<short sentence>"}},
+ "supplier": {{"order_quantity": <int>, "reasoning": "<short sentence>"}}}}
+"""
+
+BATCH_SYSTEM_PROMPT_INFORMED = """You are simulating one week of decisions
+across a 4-tier supply chain: Retailer -> Distributor -> Manufacturer -> Supplier.
+
+UNLIKE a normal supply chain, every tier here has full visibility into the
+REAL customer demand history (given below) - not just the order from the
+tier below it. Use this to tell the difference between real trend shifts
+and short-term noise, instead of just reacting to whatever the tier below
+you ordered.
+
+For each tier, decide an order quantity using this logic:
+- Look at the real customer demand history/trend to judge whether a change
+  is a genuine shift or just noise, and calibrate your order accordingly.
+- Avoid overreacting to a single week's fluctuation if the broader trend
+  is flat.
+- If a tier has a backlog, it should order more to catch up.
+- If a tier's inventory is piling up, it should order less.
+- Base decisions on the actual numbers given - do not invent a trend the
+  numbers don't support.
+
+Current state per tier:
+{tier_details}
+
+Real customer demand history (most recent last): {demand_history}
 Customer demand this week: {customer_demand} units.
 
 Respond ONLY with compact JSON in exactly this shape, no other text:
@@ -87,9 +132,12 @@ def _fallback_all(customer_demand, tier_states, note=None):
     return result
 
 
-def get_all_tier_decisions(customer_demand, tier_states):
+def get_all_tier_decisions(customer_demand, tier_states, informed=False, demand_history=None):
     """
     tier_states: dict tier_name -> {"inventory": int, "backlog": int, "order_history": list}
+    informed: if True, every tier also sees the real customer demand history
+        (tests whether information sharing reduces bullwhip for LLM agents).
+    demand_history: list of past customer demand values, required if informed=True.
     Returns dict tier_name -> (order_qty, reasoning_str) for all 4 tiers,
     from a SINGLE Groq API call.
     """
@@ -109,7 +157,16 @@ def get_all_tier_decisions(customer_demand, tier_states):
             f"backlog={st['backlog']}, last 5 orders=[{hist}]"
         )
     tier_details = "\n".join(tier_lines)
-    prompt = BATCH_SYSTEM_PROMPT.format(tier_details=tier_details, customer_demand=customer_demand)
+
+    if informed:
+        hist_str = ", ".join(str(x) for x in (demand_history or [])[-10:]) or "none yet"
+        prompt = BATCH_SYSTEM_PROMPT_INFORMED.format(
+            tier_details=tier_details, customer_demand=customer_demand, demand_history=hist_str
+        )
+    else:
+        prompt = BATCH_SYSTEM_PROMPT_ISOLATED.format(
+            tier_details=tier_details, customer_demand=customer_demand
+        )
 
     last_error = None
     for attempt in range(MAX_RETRIES):
