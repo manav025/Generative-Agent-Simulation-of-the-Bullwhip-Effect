@@ -101,7 +101,7 @@ if run_button:
             for tier in TIERS:
                 fig.add_trace(go.Scatter(y=state["order_history"][tier], name=f"{tier.capitalize()} orders"))
             fig.update_layout(title=f"{label} Policy — Orders by Tier", xaxis_title="Week", yaxis_title="Units")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     st.subheader("🌀 Bullwhip Ratios (Var(orders) / Var(demand))")
     classical_ratios = bullwhip_ratios(demand_series, classical_state["order_history"])
@@ -112,14 +112,14 @@ if run_button:
         "Classical Policy": [classical_ratios[t] for t in TIERS],
         "LLM Agents": [llm_ratios[t] for t in TIERS],
     })
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width='stretch', hide_index=True)
 
     fig2 = go.Figure(data=[
         go.Bar(name="Classical Policy", x=df["Tier"], y=df["Classical Policy"]),
         go.Bar(name="LLM Agents", x=df["Tier"], y=df["LLM Agents"]),
     ])
     fig2.update_layout(barmode="group", title="Bullwhip Amplification by Tier", yaxis_title="Bullwhip Ratio")
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width='stretch')
 
     st.info(
         "A ratio above 1 means that tier is over-reacting to demand changes "
@@ -129,7 +129,7 @@ if run_button:
 
     with st.expander("🧠 See LLM agent reasoning log"):
         reasoning_df = pd.DataFrame(llm_state["reasoning_log"])
-        st.dataframe(reasoning_df, use_container_width=True, hide_index=True)
+        st.dataframe(reasoning_df, width='stretch', hide_index=True)
 
 else:
     st.write("👈 Set your parameters in the sidebar and click **Run Simulation** to begin.")
