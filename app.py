@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 
 from simulation import run_simulation, TIERS
 from metrics import bullwhip_ratios
+import llm_client
 
 st.set_page_config(page_title="GenAI Bullwhip Simulator", layout="wide")
 
@@ -70,7 +71,15 @@ if run_button:
         classical_state = run_simulation(total_weeks, "classical", demand_series)
 
     with st.spinner("Running LLM-agent simulation (calling Groq)..."):
+        llm_client.reset_fallback_counter()
         llm_state = run_simulation(total_weeks, "llm", demand_series)
+        if llm_client.fallback_call_count > 0:
+            st.warning(
+                f"⚠️ {llm_client.fallback_call_count} of {total_weeks * 4} agent calls "
+                f"fell back to the simple heuristic (likely rate limits). Those weeks "
+                f"are NOT pure LLM reasoning - re-run for a cleaner result, or reduce "
+                f"'Number of weeks' to lower the total call volume."
+            )
 
     st.subheader("📈 Orders Placed by Each Tier")
     tab1, tab2 = st.tabs(["Classical Policy", "LLM Agents"])
