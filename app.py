@@ -32,14 +32,14 @@ with st.sidebar:
     shock_size = st.slider("Shock size (extra units)", 0, 100, 30)
     noise = st.slider("Demand noise (std dev)", 0, 20, 5)
 
-    hf_token = st.text_input(
-        "Hugging Face Token (optional — leave blank to use fallback heuristic)",
+    groq_key = st.text_input(
+        "Groq API Key (optional — leave blank to use fallback heuristic)",
         type="password",
-        help="Get a free token at huggingface.co/settings/tokens. "
+        help="Get a free key at console.groq.com/keys — no credit card required. "
              "Without it, LLM-mode agents fall back to a simple heuristic.",
     )
-    if hf_token:
-        os.environ["HF_TOKEN"] = hf_token
+    if groq_key:
+        os.environ["GROQ_API_KEY"] = groq_key
 
     run_button = st.button("Run Simulation", type="primary")
 
@@ -60,7 +60,7 @@ if run_button:
     with st.spinner("Running classical order-up-to-S simulation..."):
         classical_state = run_simulation(total_weeks, "classical", demand_series)
 
-    with st.spinner("Running LLM-agent simulation (calling Hugging Face)..."):
+    with st.spinner("Running LLM-agent simulation (calling Groq)..."):
         llm_state = run_simulation(total_weeks, "llm", demand_series)
 
     st.subheader("📈 Orders Placed by Each Tier")
