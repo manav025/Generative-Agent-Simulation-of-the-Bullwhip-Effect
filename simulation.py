@@ -3,11 +3,21 @@ simulation.py
 Core simulation engine. Uses LangGraph to orchestrate a 4-tier supply chain
 (Retailer -> Distributor -> Manufacturer -> Supplier) week by week.
 
+THREE MODES:
+  - "classical" : every tier applies the fixed order-up-to-S formula.
+  - "llm"        : LLM agents, each tier ONLY sees the order from the tier
+                   below it (isolated / no real-demand visibility) - this
+                   is what causes the bullwhip effect classically.
+  - "llm_informed": LLM agents, but every tier ALSO sees the real customer
+                   demand history directly. Tests whether giving LLM agents
+                   real information reduces bullwhip amplification (the
+                   classic supply-chain "information sharing" finding),
+                   and whether they can do better than a rigid formula
+                   once they can tell real trend from noise.
+
 Each week:
-  1. In "llm" mode: ONE batched API call decides all 4 tiers' order
-     quantities together (see llm_client.get_all_tier_decisions) - this
-     keeps run time and token usage low (1 call/week instead of 4).
-     In "classical" mode: each tier applies the order-up-to-S formula.
+  1. In LLM modes: ONE batched API call decides all 4 tiers' order
+     quantities together (see llm_client.get_all_tier_decisions).
   2. Each tier ships what it can from inventory, carries forward backlog,
      and receives inventory arriving from its own earlier order (lead time).
   3. We record every tier's order quantity so we can compute the bullwhip
@@ -27,7 +37,7 @@ LEAD_TIME = 2  # weeks for an order to arrive as usable inventory
 class SimState(TypedDict):
     week: int
     total_weeks: int
-    mode: Literal["llm", "classical"]
+    mode: Literal["llm", "llm_informed", "classical"]
     customer_demand_series: List[int]
 
     inventory: dict          # tier -> current on-hand inventory
@@ -56,10 +66,10 @@ def _init_state(total_weeks, mode, customer_demand_series) -> SimState:
 
 
 def _llm_batch_decide(state: SimState) -> SimState:
-    """Runs once per week, before the tier nodes, when mode == 'llm'.
+    """Runs once per week, before the tier nodes, when mode is an LLM mode.
     Makes a SINGLE API call that decides all 4 tiers' order quantities,
     instead of one call per tier."""
-    if state["mode"] != "llm":
+    if state["mode"] not in ("llm", "llm_informed"):
         return state
 
     week = state["week"]
@@ -72,7 +82,15 @@ def _llm_batch_decide(state: SimState) -> SimState:
         }
         for t in TIERS
     }
-    state["batch_decisions"] = get_all_tier_decisions(customer_demand, tier_states)
+
+    if state["mode"] == "llm_informed":
+        demand_history = state["customer_demand_series"][: week + 1]
+        state["batch_decisions"] = get_all_tier_decisions(
+            customer_demand, tier_states, informed=True, demand_history=demand_history
+        )
+    else:
+        state["batch_decisions"] = get_all_tier_decisions(customer_demand, tier_states)
+
     return state
 
 
@@ -93,7 +111,7 @@ def _tier_node_factory(tier_name, tier_index):
         inventory = state["inventory"][tier_name]
         backlog = state["backlog"][tier_name]
 
-        if state["mode"] == "llm":
+        if state["mode"] in ("llm", "llm_informed"):
             qty, reasoning = state["batch_decisions"][tier_name]
         else:
             qty = order_up_to_decision(demand_signal, inventory, backlog, state["pipeline"][tier_name])
@@ -148,8 +166,7 @@ def build_graph():
 def run_simulation(total_weeks, mode, customer_demand_series):
     """
     Runs the full multi-week simulation by invoking the compiled LangGraph
-    once per week (LangGraph handles one 4-tier pass per invocation here;
-    we loop weeks in Python for clarity and to keep state simple).
+    once per week. mode is one of "classical", "llm", "llm_informed".
     """
     app = build_graph()
     state = _init_state(total_weeks, mode, customer_demand_series)
